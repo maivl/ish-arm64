@@ -1,0 +1,262 @@
+name: Build iSH ARM64 iOS Integration Package
+
+on:
+  push:
+    branches:
+      - master
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - master
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build & Package (ARM64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            python3 python3-pip \
+            ninja-build \
+            libarchive-dev \
+            libsqlite3-dev \
+            clang llvm lld
+          pip3 install meson
+
+      - name: Apply Linux compatibility patches
+        run: |
+          # 1) Remove = NULL initializers from _Atomic variables
+          #    (clang on Linux doesn't support this; static storage is zero-init)
+          sed -i 's/static _Atomic(\(.*\)) \(.*\) = NULL;/static _Atomic(\1) \2;/' \
+            kernel/calls.c kernel/fork.c fs/fake.c
+
+          # 2) Replace macOS-specific struct stat members with Linux equivalents
+          sed -i 's/st_mtimespec/st_mtim/g; s/st_atimespec/st_atim/g; s/st_ctimespec/st_ctim/g' \
+            fs/fake.c kernel/calls.c
+
+          # 3) Create Linux compat header for F_GETPATH (macOS-only fcntl cmd)
+          cat > ish-linux-compat.h <<'EOF'
+          #ifndef ISH_LINUX_COMPAT_H
+          #define ISH_LINUX_COMPAT_H
+          #ifndef F_GETPATH
+          #define F_GETPATH (-1)
+          #endif
+          #endif
+          EOF
+
+          echo "=== Patched files ==="
+          git diff --stat
+
+      - name: Configure Meson (ARM64 guest, release)
+        run: |
+          meson setup build \
+            -Dguest_arch=arm64 \
+            -Dkernel=ish \
+            -Dengine=asbestos \
+            --buildtype=release
+        env:
+          CC: clang
+          CFLAGS: "-include ${{ github.workspace }}/ish-linux-compat.h"
+
+      - name: Build static libraries
+        run: |
+          ninja -C build libish.a libish_emu.a libfakefs.a
+
+      - name: Build VDSO
+        run: |
+          ninja -C build vdso/arm64/libvdso.so.elf
+
+      - name: Build fakefsify tool
+        run: |
+          ninja -C build tools/fakefsify
+
+      - name: Verify build artifacts
+        run: |
+          echo "=== Static Libraries ==="
+          for lib in libish.a libish_emu.a libfakefs.a; do
+            if [ -f "build/$lib" ]; then
+              size=$(stat -c%s "build/$lib")
+              objs=$(ar t "build/$lib" 2>/dev/null | wc -l)
+              echo "  ✓ $lib  (${size} bytes, ${objs} objects)"
+            else
+              echo "  ✗ $lib  NOT FOUND"
+              exit 1
+            fi
+          done
+          echo ""
+          echo "=== VDSO ==="
+          file build/vdso/arm64/libvdso.so.elf
+          echo ""
+          echo "=== fakefsify ==="
+          file build/tools/fakefsify
+
+      - name: Download Alpine minirootfs
+        run: |
+          mkdir -p packaging
+          curl -fSL -o packaging/alpine-minirootfs.tar.gz \
+            "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/aarch64/alpine-minirootfs-3.21.0-aarch64.tar.gz"
+          ls -lh packaging/alpine-minirootfs.tar.gz
+
+      - name: Convert rootfs to fakefs format
+        run: |
+          mkdir -p rootfs
+          build/tools/fakefsify packaging/alpine-minirootfs.tar.gz rootfs
+          echo "=== Rootfs ==="
+          du -sh rootfs/
+          ls -la rootfs/
+
+      - name: Assemble integration package
+        run: |
+          PKG_DIR="ish-arm64-ios-integration"
+          mkdir -p "$PKG_DIR"/{libraries,vdso,rootfs,build-patches}
+
+          # Pre-built artifacts
+          cp build/libish.a      "$PKG_DIR/libraries/"
+          cp build/libish_emu.a  "$PKG_DIR/libraries/"
+          cp build/libfakefs.a   "$PKG_DIR/libraries/"
+          cp build/vdso/arm64/libvdso.so.elf "$PKG_DIR/vdso/"
+
+          # Rootfs (fakefs format)
+          cp -r rootfs/* "$PKG_DIR/rootfs/"
+          cp packaging/alpine-minirootfs.tar.gz \
+            "$PKG_DIR/rootfs/alpine-minirootfs-3.21.0-aarch64.tar.gz"
+
+          # fakefsify tool
+          cp build/tools/fakefsify "$PKG_DIR/"
+
+          # Build patches (for documentation)
+          git diff > "$PKG_DIR/build-patches/linux-compat.patch"
+          cp ish-linux-compat.h "$PKG_DIR/build-patches/"
+
+          # Source code (exclude .git, build dirs, packaging)
+          mkdir -p "$PKG_DIR/source"
+          tar -cf - \
+            --exclude='.git' \
+            --exclude='build' \
+            --exclude='packaging' \
+            --exclude='*.o' \
+            . | tar -xf - -C "$PKG_DIR/source/"
+
+          # Build info
+          cat > "$PKG_DIR/BUILD_INFO.txt" <<EOF
+          iSH ARM64 iOS Integration Package
+          =================================
+          Build Time:   $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          Compiler:     clang
+          Guest Arch:   arm64
+          Kernel:       ish
+          Engine:       asbestos
+          Build Type:   release
+          Git Commit:   $(git rev-parse --short HEAD)
+          Git Branch:   $(git rev-parse --abbrev-ref HEAD)
+          Runner:       ubuntu-24.04-arm
+
+          Libraries:
+          - libish.a     : $(stat -c%s build/libish.a) bytes
+          - libish_emu.a : $(stat -c%s build/libish_emu.a) bytes
+          - libfakefs.a  : $(stat -c%s build/libfakefs.a) bytes
+
+          VDSO:           $(stat -c%s build/vdso/arm64/libvdso.so.elf) bytes
+          Rootfs:         $(du -sh rootfs/ | cut -f1) (Alpine 3.21.0 aarch64 fakefs)
+          EOF
+
+          # Checksums
+          cd "$PKG_DIR/libraries"
+          sha256sum *.a > SHA256SUMS.txt
+          cd ../..
+
+          echo "=== Package contents ==="
+          find "$PKG_DIR" -maxdepth 2 -not -path "*/source/*" | sort
+          echo ""
+          du -sh "$PKG_DIR"
+
+      - name: Create zip archive
+        run: |
+          zip -r ish-arm64-ios-integration.zip \
+            ish-arm64-ios-integration/ \
+            -x '*.DS_Store'
+          ls -lh ish-arm64-ios-integration.zip
+
+      - name: Upload integration package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ish-arm64-ios-integration
+          path: ish-arm64-ios-integration.zip
+          retention-days: 30
+
+      - name: Upload static libraries (standalone)
+        uses: actions/upload-artifact@v4
+        with:
+          name: static-libs
+          path: |
+            build/libish.a
+            build/libish_emu.a
+            build/libfakefs.a
+          retention-days: 30
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download integration package
+        uses: actions/download-artifact@v4
+        with:
+          name: ish-arm64-ios-integration
+          path: release-assets
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true
+          name: iSH ARM64 iOS Integration ${{ github.ref_name }}
+          body: |
+            ## iSH ARM64 iOS Integration Package
+
+            ### Contents
+
+            | Component | Description |
+            |-----------|-------------|
+            | `libraries/` | Pre-built static libraries (libish.a, libish_emu.a, libfakefs.a) |
+            | `vdso/` | ARM64 VDSO binary (libvdso.so.elf) |
+            | `rootfs/` | Alpine 3.21.0 aarch64 rootfs in fakefs format |
+            | `source/` | Full iSH ARM64 source code with Xcode project |
+            | `fakefsify` | Rootfs conversion tool |
+            | `build-patches/` | Linux build compatibility patches |
+
+            ### Build Configuration
+
+            - **Guest Architecture**: ARM64 (AArch64)
+            - **Kernel**: iSH
+            - **Engine**: Asbestos
+            - **Build Type**: Release (-O3)
+            - **Compiler**: clang
+            - **Runner**: ubuntu-24.04-arm
+
+            ### Usage
+
+            1. Unzip the package
+            2. Link `libraries/libish.a`, `libraries/libish_emu.a`, `libraries/libfakefs.a` into your Xcode project
+            3. Add `vdso/libvdso.so.elf` as a resource
+            4. Add `rootfs/data/` and `rootfs/meta.db` as resources
+            5. Use `source/app/` xcconfig files for build settings
