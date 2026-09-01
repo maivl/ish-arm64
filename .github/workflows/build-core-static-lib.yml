@@ -113,7 +113,7 @@ jobs:
 
       - name: Convert rootfs to fakefs format
         run: |
-          mkdir -p rootfs
+          rm -rf rootfs
           build/tools/fakefsify packaging/alpine-minirootfs.tar.gz rootfs
           echo "=== Rootfs ==="
           du -sh rootfs/
